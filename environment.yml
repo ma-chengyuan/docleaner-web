@@ -1,0 +1,13 @@
+name: docleaner-web
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python
+  - selenium
+  - pillow
+  - tqdm
+  - pytesseract
+  - pip:
+    - pymupdf
+
