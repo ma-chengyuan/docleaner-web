@@ -22,104 +22,47 @@ SOFTWARE. """
 import base64
 import io
 import os
-import tempfile
-import time
-from contextlib import contextmanager
-from typing import Optional, Generator, Union
+from typing import Optional, Generator, Union, Tuple
 
 import click
 import fitz
 import pytesseract
+import requests
 from PIL import Image
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support import expected_conditions
-from selenium.webdriver.support.ui import WebDriverWait
 from tqdm import tqdm
 
 StrPath = Union[str, os.PathLike]
 
 
-def clean_doc_online(images: Generator[StrPath, None, None], browser: str) \
+def clean_doc_selenium(images: Generator[Tuple[bytes, str], None, None]) \
         -> Generator[Image.Image, None, None]:
     """
     Cleans the scanned document pages using docleaner's online service.
 
     :param images: A generator yielding paths to document pages.
-    :param browser: Browser type, can be "chrome", "firefox", "safari", or
-        "edge". Requires the browser and its webdriver to be installed.
     """
-    if browser == "chrome":
-        browser = webdriver.Chrome()
-    elif browser == "firefox":
-        browser = webdriver.Firefox()
-    elif browser == "safari":
-        browser = webdriver.Safari()
-    elif browser == "edge":
-        browser = webdriver.Edge()
-    else:
-        raise RuntimeError("Unknown browser type")
-    # Timeout for web driver waits. 10s is a reasonable value unless you have
-    # a very high-res image / terrible network.
-    timeout = 10
-    browser.get("http://www.docleaner.cn/experience.html")
-
-    # Turn on background removal and automatic deskewing.
-    WebDriverWait(browser, timeout).until(
-        expected_conditions.visibility_of_element_located(
-            (By.XPATH,
-             "//input[@value='去背景']/parent::div/preceding-sibling::button")
-        )
-    ).click()
-    WebDriverWait(browser, timeout).until(
-        expected_conditions.visibility_of_element_located(
-            (By.XPATH,
-             "//input[@value='自动纠斜']/parent::div/preceding-sibling::button")
-        )
-    ).click()
-    # Wait for a while to ensure the changes take effect.
-    time.sleep(1)
-
-    uploader = WebDriverWait(browser, timeout).until(
-        expected_conditions.presence_of_element_located(
-            (By.CLASS_NAME, "layui-upload-file")))
-
-    try:
-        uploader.send_keys(next(images))
-        while True:
-            # Write like this instead of a for loop enables us to fetch the
-            # next image while the browser & remote server are processing the
-            # image just uploaded. Converting a pdf page to an image is slow,
-            # so we here save a lot of time :)
-            next_image = next(images)
-            # Wait for the result image to be visible.
-            result = WebDriverWait(browser, timeout).until(
-                expected_conditions.visibility_of_element_located(
-                    (By.ID, "dragImgRight")))
-            # Hide the result image again so the wait condition above can be
-            # re-used.
-            browser.execute_script(
-                "arguments[0].parentNode.classList.add('layui-hide');", result)
-            result = result.get_attribute("src")
-            result = base64.b64decode(
-                result.replace("data:image/jpg;base64,", ""))
-            yield Image.open(io.BytesIO(result))
-            if next_image == "":
-                # See convert_pdf_to_images for the reason behind this weird
-                # branch.
-                break
-            uploader.send_keys(next_image)
-    except StopIteration:
-        pass
-
-    browser.quit()
+    for (image, ext) in images:
+        # noinspection HttpUrlsUsage
+        req = requests.post("http://service.docleaner.cn/attachCollect/upload",
+                            files={"file": (f"image.{ext}", image)})
+        data = {
+            # Weird typo in the API.
+            "paramers": "降噪,去斑点,去黑边,去背景,自动纠斜",
+            "type": "image",
+            "storePath": req.json()["data"]["storePath"],
+            "userId": ""
+        }
+        # noinspection HttpUrlsUsage
+        req = requests.post("http://service.docleaner.cn/exe/daqw", data=data)
+        result = base64.b64decode(req.json()["data"]["outFileStr"])
+        yield Image.open(io.BytesIO(result))
 
 
 def convert_pdf_to_images(pdf: StrPath, fmt: str, dpi: int,
                           output: Optional[StrPath] = None,
                           first_page: Optional[int] = None,
                           last_page: Optional[int] = None) \
-        -> Generator[StrPath, None, None]:
+        -> Generator[Tuple[bytes, str], None, None]:
     """
     Converts a pdf file to images. This a necessary pre-processing step
     because docleaner online only accepts images as inputs.
@@ -132,34 +75,21 @@ def convert_pdf_to_images(pdf: StrPath, fmt: str, dpi: int,
     :param output: The output directory of intermediate images.
     :param first_page: First page to convert (starting from 1, inclusive).
     :param last_page: Last page to convert (starting from 1, inclusive).
-    :return: A generator yielding the paths to the images.
+    :return: A generator yielding (image as raw bytes, image format).
     """
     doc = fitz.Document(pdf)
-
-    @contextmanager
-    def normal_dir(dir_path):
-        from pathlib import Path
-        Path(dir_path).mkdir(parents=True, exist_ok=True)
-        yield dir_path
 
     matrix = fitz.Matrix(dpi / 72, dpi / 72)
     first_page = 0 if first_page is None else first_page - 1
     last_page = doc.page_count if last_page is None else last_page
-    with tempfile.TemporaryDirectory() if output is None else normal_dir(
-            output) as path:
-        for i in range(first_page, last_page):
-            filename = os.path.join(path, f"{i}.{fmt}")
-            # noinspection PyUnresolvedReferences
-            doc[i].get_pixmap(matrix=matrix).save(filename)
-            yield filename
-        if output is None:
-            # Yield an empty string if we are using a temporary directory,
-            # because without this, the temporary directory will be cleaned
-            # up the moment the last filename is yielded, when the caller
-            # hasn't done anything to the yielded temp file yet. Yielding an
-            # emtpy string keeps the TemporaryDirectory object in memory
-            # longer so the problem is solved.
-            yield ""
+    for i in range(first_page, last_page):
+        # noinspection PyUnresolvedReferences
+        data = doc[i].get_pixmap(matrix=matrix).tobytes()
+        if output is not None:
+            filename = os.path.join(output, f"{i}.{fmt}")
+            with open(filename, "wb") as file:
+                file.write(data)
+        yield data, "png"
 
 
 def convert_images_to_pdf(images: Generator[Image.Image, None, None],
@@ -198,21 +128,19 @@ def convert_images_to_pdf(images: Generator[Image.Image, None, None],
 @click.option("-f", "--format", default="png",
               help="Intermediate image format.")
 @click.option("-d", "--dpi", default=300, help="DPI for rasterization.")
-@click.option("-b", "--browser", default="chrome",
-              help="The browser selenium uses.")
 @click.option("--first-page", type=int, help="First page to convert/clean.")
 @click.option("--last-page", type=int, help="Last page to convert/clean.")
 @click.option("--ocr/--no-ocr", default=True,
               help="Whether to perform OCR during the conversion.")
 @click.option("--clean/--dont-clean", default=True,
               help="Whether to clean pdf using docleaner's online service.")
-def main(input: str, output: str, format: str, dpi: int, browser: str,
+def main(input: str, output: str, format: str, dpi: int,
          first_page: Optional[int], last_page: Optional[int], ocr: bool,
          clean: bool):
     images = convert_pdf_to_images(input, fmt=format, dpi=dpi,
                                    first_page=first_page, last_page=last_page)
     if clean:
-        images = clean_doc_online(images, browser)
+        images = clean_doc_selenium(images)
     doc = fitz.Document(input)
     total = (doc.page_count if last_page is None else last_page) \
         - (0 if first_page is None else first_page - 1)

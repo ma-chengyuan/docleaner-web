@@ -4,7 +4,7 @@ channels:
   - defaults
 dependencies:
   - python
-  - selenium
+  - requests
   - pillow
   - tqdm
   - pytesseract
